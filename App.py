@@ -20,35 +20,40 @@ def is_card_enabled(name: str, set_code: str, number: str) -> bool:
 
 @st.cache_data(ttl=3600)
 def fetch_card_details(name: str, set_code: str, number: str) -> dict | None:
-    """Fetches card image and game text from TCGdex (no price data)."""
+    """Fetches card image and game text from TCGdex, with a Limitless image fallback."""
     clean_num = str(number).strip().lstrip("0")
+    padded_num = clean_num.zfill(3)
     target_set = set_code.strip().upper()
+    fallback_img = f"https://limitlesstcg.nyc3.cdn.digitaloceanspaces.com/tpci/{target_set}/{target_set}_{padded_num}_R_EN_LG.png"
 
     try:
-        # Search TCGdex by card name first, then match set code/name & collector number
         resp = requests.get(f"{TCGDEX_API}/cards", params={"name": name.strip()}, timeout=10)
-        if resp.status_code != 200:
-            return None
+        if resp.status_code == 200:
+            candidates = resp.json()
+            for item in candidates:
+                if str(item.get("localId", "")).lstrip("0") != clean_num:
+                    continue
 
-        candidates = resp.json()
-        for item in candidates:
-            if str(item.get("localId", "")).lstrip("0") != clean_num:
-                continue
+                detail_resp = requests.get(f"{TCGDEX_API}/cards/{item['id']}", timeout=10)
+                if detail_resp.status_code != 200:
+                    continue
 
-            detail_resp = requests.get(f"{TCGDEX_API}/cards/{item['id']}", timeout=10)
-            if detail_resp.status_code != 200:
-                continue
+                card = detail_resp.json()
+                set_info = card.get("set", {})
+                tcg_online = str(set_info.get("tcgOnline") or "").upper()
+                set_id = str(set_info.get("id") or "").upper()
 
-            card = detail_resp.json()
-            set_info = card.get("set", {})
-            tcg_online = str(set_info.get("tcgOnline") or "").upper()
-            set_id = str(set_info.get("id") or "").upper()
-
-            if target_set in (tcg_online, set_id) or len(candidates) == 1:
-                return card
+                if target_set in (tcg_online, set_id) or len(candidates) == 1:
+                    # Append /high.webp if TCGdex has an image, otherwise use fallback
+                    if card.get("image"):
+                        card["resolved_image"] = f"{card['image']}/high.webp"
+                    else:
+                        card["resolved_image"] = fallback_img
+                    return card
     except requests.RequestException:
-        return None
-    return None
+        pass
+
+    return {"name": name, "resolved_image": fallback_img}
 
 
 @st.cache_data(ttl=600)
@@ -101,8 +106,8 @@ def render_card_panel(card_data: dict | None, fallback_name: str, set_code: str,
     col_img, col_info = st.columns([1, 2], gap="large")
 
     with col_img:
-        if card_data and card_data.get("image"):
-            st.image(f"{card_data['image']}/high.webp", use_container_width=True)
+        if card_data and card_data.get("resolved_image"):
+            st.image(card_data["resolved_image"], use_container_width=True)
         else:
             st.info(f"Card preview unavailable for {fallback_name} ({set_code} {number}).")
 
