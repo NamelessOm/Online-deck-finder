@@ -1,3 +1,4 @@
+import re
 import time
 import pandas as pd
 import requests
@@ -9,21 +10,102 @@ st.set_page_config(page_title="Limitless Card Tournament Finder", layout="wide")
 LIMITLESS_API = "https://play.limitlesstcg.com/api"
 TCGDEX_API = "https://api.tcgdex.net/v2/en"
 
+ENGLISH_SET_CODE_RE = re.compile(r"^[A-Z0-9]{2,6}$")
+
+
+def _is_english_set_code(code: str) -> bool:
+    """
+    Returns True for standard uppercase English/PTCGL set codes (e.g., DLR, PAR, SV04, SVP)
+    and False for lowercase/Japanese-style codes (e.g., sv2a, sm12a) or empty strings.
+    """
+    cleaned = str(code or "").strip()
+    if not cleaned or cleaned != cleaned.upper():
+        return False
+    if re.fullmatch(r"(SV|SM|XY|BW|S)\d+[A-Z]+", cleaned):
+        return False
+    return bool(ENGLISH_SET_CODE_RE.fullmatch(cleaned))
+
+
+def _card_number_sort_key(number_str: str) -> tuple[int, str]:
+    """Sorts card numbers numerically first, then textually as a tie-breaker."""
+    cleaned = str(number_str).strip()
+    digits = "".join(ch for ch in cleaned if ch.isdigit())
+    num_val = int(digits) if digits else 0
+    return (num_val, cleaned.upper())
+
 
 @st.cache_data(ttl=86400)
-def load_set_code_map() -> dict[str, str]:
-    """Maps TCGdex set IDs (e.g., 'sv04') to Limitless/PTCGL set codes (e.g., 'PAR')."""
-    mapping = {}
+def load_set_metadata() -> dict[str, dict[str, str]]:
+    """
+    Maps TCGdex English set IDs to their English set code and releaseDate (YYYY-MM-DD).
+    Only includes sets with a recognized English set code.
+    """
+    meta: dict[str, dict[str, str]] = {}
     try:
         resp = requests.get(f"{TCGDEX_API}/sets", timeout=15)
         if resp.status_code == 200:
             for s in resp.json():
-                set_id = str(s.get("id", "")).lower()
-                tcg_code = str(s.get("tcgOnline") or set_id).upper()
-                mapping[set_id] = tcg_code
+                set_id = str(s.get("id", "")).lower().strip()
+                tcg_code = str(s.get("tcgOnline") or "").strip().upper()
+                if not set_id or not _is_english_set_code(tcg_code):
+                    continue
+
+                release_date = str(s.get("releaseDate") or "0000-00-00")
+                meta[set_id] = {
+                    "code": tcg_code,
+                    "release_date": release_date,
+                }
     except requests.RequestException:
         pass
-    return mapping
+    return meta
+
+
+@st.cache_data(ttl=3600)
+def search_card_suggestions(searchterm: str) -> list[tuple[str, dict]]:
+    """
+    Queries TCGdex for English cards as the user types, filters to English set codes,
+    and returns (label, card_dict) tuples sorted newest-first.
+    """
+    query = searchterm.strip()
+    if len(query) < 2:
+        return []
+
+    set_meta = load_set_metadata()
+    candidates = []
+
+    try:
+        resp = requests.get(f"{TCGDEX_API}/cards", params={"name": query}, timeout=8)
+        if resp.status_code != 200:
+            return []
+
+        for item in resp.json():
+            card_id = str(item.get("id", ""))
+            name = item.get("name", "Unknown")
+            local_id = str(item.get("localId", "")).strip()
+            raw_set_id = card_id.split("-")[0].lower() if "-" in card_id else ""
+
+            info = set_meta.get(raw_set_id)
+            if not info:
+                continue
+
+            set_code = info["code"]
+            release_date = info["release_date"]
+
+            label = f"{name} ({set_code} #{local_id})"
+            payload = {
+                "id": card_id,
+                "name": name,
+                "set_code": set_code,
+                "number": local_id,
+                "image": item.get("image", ""),
+                "release_date": release_date,
+            }
+            candidates.append((release_date, _card_number_sort_key(local_id), label, payload))
+
+        candidates.sort(key=lambda entry: (entry[0], entry[1]), reverse=True)
+        return [(entry[2], entry[3]) for entry in candidates[:25]]
+    except requests.RequestException:
+        return []
 
 
 def get_gameplay_fingerprint(card: dict) -> tuple:
@@ -54,44 +136,6 @@ def get_gameplay_fingerprint(card: dict) -> tuple:
 
 
 @st.cache_data(ttl=3600)
-def search_card_suggestions(searchterm: str) -> list[tuple[str, dict]]:
-    """Queries TCGdex as the user types and returns (label, card_dict) tuples for the dropdown."""
-    query = searchterm.strip()
-    if len(query) < 2:
-        return []
-
-    set_map = load_set_code_map()
-    results = []
-
-    try:
-        resp = requests.get(f"{TCGDEX_API}/cards", params={"name": query}, timeout=8)
-        if resp.status_code != 200:
-            return []
-
-        matches = resp.json()[:25]
-        for item in matches:
-            card_id = item.get("id", "")
-            name = item.get("name", "Unknown")
-            local_id = str(item.get("localId", ""))
-            raw_set_id = card_id.split("-")[0].lower() if "-" in card_id else ""
-            set_code = set_map.get(raw_set_id, raw_set_id.upper())
-
-            label = f"{name} ({set_code} #{local_id})"
-            payload = {
-                "id": card_id,
-                "name": name,
-                "set_code": set_code,
-                "number": local_id,
-                "image": item.get("image", ""),
-            }
-            results.append((label, payload))
-    except requests.RequestException:
-        return []
-
-    return results
-
-
-@st.cache_data(ttl=3600)
 def fetch_full_card_details(selected_card: dict) -> dict:
     """Fetches full card stats/attacks and resolves the high-res image (no pricing)."""
     card_id = selected_card.get("id", "")
@@ -106,7 +150,7 @@ def fetch_full_card_details(selected_card: dict) -> dict:
             if resp.status_code == 200:
                 card = resp.json()
                 tcg_online = str(card.get("set", {}).get("tcgOnline") or "").upper()
-                card["resolved_set_code"] = tcg_online if tcg_online else set_code
+                card["resolved_set_code"] = tcg_online if _is_english_set_code(tcg_online) else set_code
                 card["resolved_number"] = str(card.get("localId", number)).strip()
                 card["resolved_image"] = f"{card['image']}/high.webp" if card.get("image") else fallback_img
                 return card
@@ -132,13 +176,13 @@ def resolve_deck_card_image(name: str, set_code: str, number: str) -> str:
     try:
         resp = requests.get(f"{TCGDEX_API}/cards", params={"name": name.strip()}, timeout=8)
         if resp.status_code == 200:
-            set_map = load_set_code_map()
+            set_meta = load_set_metadata()
             for item in resp.json():
                 if str(item.get("localId", "")).lstrip("0") != clean_num:
                     continue
                 cid = item.get("id", "")
                 raw_set_id = cid.split("-")[0].lower() if "-" in cid else ""
-                mapped_set = set_map.get(raw_set_id, raw_set_id.upper())
+                mapped_set = set_meta.get(raw_set_id, {}).get("code")
                 if mapped_set == clean_set and item.get("image"):
                     return f"{item['image']}/high.webp"
     except requests.RequestException:
@@ -150,7 +194,7 @@ def resolve_deck_card_image(name: str, set_code: str, number: str) -> str:
 @st.cache_data(ttl=3600)
 def find_equivalent_printings(base_card: dict, include_alt_arts: bool) -> list[dict]:
     """
-    Finds all functionally identical printings (alt arts, SIRs, reprints, promos)
+    Finds all functionally identical English printings (alt arts, SIRs, reprints, promos)
     matching the selected card's name and gameplay fingerprint.
     """
     base_name = base_card.get("name", "").strip()
@@ -168,7 +212,7 @@ def find_equivalent_printings(base_card: dict, include_alt_arts: bool) -> list[d
         return [primary_printing]
 
     target_fp = get_gameplay_fingerprint(base_card)
-    set_map = load_set_code_map()
+    set_meta = load_set_metadata()
     equivalents = []
     seen = set()
 
@@ -179,7 +223,12 @@ def find_equivalent_printings(base_card: dict, include_alt_arts: bool) -> list[d
                 if str(item.get("name", "")).strip().lower() != base_name.lower():
                     continue
 
-                cid = item.get("id", "")
+                cid = str(item.get("id", ""))
+                raw_set_id = cid.split("-")[0].lower() if "-" in cid else ""
+                info = set_meta.get(raw_set_id)
+                if not info:
+                    continue
+
                 detail_resp = requests.get(f"{TCGDEX_API}/cards/{cid}", timeout=10)
                 if detail_resp.status_code != 200:
                     continue
@@ -188,9 +237,8 @@ def find_equivalent_printings(base_card: dict, include_alt_arts: bool) -> list[d
                 if get_gameplay_fingerprint(cand) != target_fp:
                     continue
 
-                raw_set_id = cid.split("-")[0].lower() if "-" in cid else ""
-                tcg_online = str(cand.get("set", {}).get("tcgOnline") or "").upper()
-                cand_set = tcg_online or set_map.get(raw_set_id, raw_set_id.upper())
+                tcg_online = str(cand.get("set", {}).get("tcgOnline") or "").strip().upper()
+                cand_set = tcg_online if _is_english_set_code(tcg_online) else info["code"]
                 cand_num = str(cand.get("localId", "")).strip()
 
                 key = (cand_set, cand_num.lstrip("0"))
@@ -388,7 +436,7 @@ with col_search1:
     st.markdown("#### 1. Primary Card (Required)")
     selected_card_1 = st_searchbox(
         search_card_suggestions,
-        placeholder="Start typing a card name (e.g. Mega Golisopod ex, Cacturne)...",
+        placeholder="Start typing a card name (e.g. Talonflame, Cacturne)...",
         key="card1_searchbox",
         clear_on_submit=False,
     )
@@ -553,4 +601,9 @@ if run_search or st.session_state.search_results:
         pick_col, btn_col = st.columns([3, 1], vertical_alignment="bottom")
         chosen_label = pick_col.selectbox("Select a matching decklist to preview", deck_options, key="visual_deck_select")
         if btn_col.button("Show Visual Decklist", type="secondary", use_container_width=True):
-            st.session_state.active_visual_
+            st.session_state.active_visual_deck_idx = deck_options.index(chosen_label)
+
+        if st.session_state.active_visual_deck_idx is not None:
+            idx = st.session_state.active_visual_deck_idx
+            if 0 <= idx < len(matches):
+                render_visual_decklist(matches[idx])
