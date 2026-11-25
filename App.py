@@ -12,15 +12,46 @@ TCGDEX_API = "https://api.tcgdex.net/v2/en"
 
 ENGLISH_SET_CODE_RE = re.compile(r"^[A-Z0-9]{2,6}$")
 
+# English Black Star Promo set codes that should always be included
+ENGLISH_PROMO_SET_CODES = {
+    "SVP",    # Scarlet & Violet Black Star Promos
+    "SWSHP",  # Sword & Shield Black Star Promos
+    "SMP",    # Sun & Moon Black Star Promos
+    "XYSP",   # XY Black Star Promos
+    "BWP",    # Black & White Black Star Promos
+    "DPP",    # Diamond & Pearl Black Star Promos
+    "HGP",    # HGSS Black Star Promos
+    "WSP",    # Wizards Black Star Promos
+}
+
+# Maps common promo set IDs/names to their canonical English promo code
+PROMO_ID_ALIASES = {
+    "svp": "SVP",
+    "swshp": "SWSHP",
+    "smp": "SMP",
+    "xysp": "XYSP",
+    "bwp": "BWP",
+    "dpp": "DPP",
+    "hgss-promos": "HGP",
+    "hgp": "HGP",
+    "basep": "WSP",
+    "wsp": "WSP",
+}
+
 
 def _is_english_set_code(code: str) -> bool:
     """
-    Returns True for standard uppercase English/PTCGL set codes (e.g., DLR, PAR, SV04, SVP)
-    and False for lowercase/Japanese-style codes (e.g., sv2a, sm12a) or empty strings.
+    Returns True for English Black Star Promo codes (like SVP, SWSHP) and standard
+    uppercase English/PTCGL set codes, while rejecting Japanese-style set codes.
     """
-    cleaned = str(code or "").strip()
-    if not cleaned or cleaned != cleaned.upper():
+    cleaned = str(code or "").strip().upper()
+    if not cleaned:
         return False
+    if cleaned in ENGLISH_PROMO_SET_CODES:
+        return True
+    if str(code).strip() != cleaned:
+        return False
+    # Reject Japanese subset suffixes like SV2A, SM12A, M1S
     if re.fullmatch(r"(SV|SM|XY|BW|S)\d+[A-Z]+", cleaned):
         return False
     return bool(ENGLISH_SET_CODE_RE.fullmatch(cleaned))
@@ -37,8 +68,8 @@ def _card_number_sort_key(number_str: str) -> tuple[int, str]:
 @st.cache_data(ttl=86400)
 def load_set_metadata() -> dict[str, dict[str, str]]:
     """
-    Maps TCGdex English set IDs to their English set code and releaseDate (YYYY-MM-DD).
-    Only includes sets with a recognized English set code.
+    Maps TCGdex English set IDs to their English set code and releaseDate (YYYY-MM-DD),
+    always preserving English Black Star Promo set codes like SVP and SWSHP.
     """
     meta: dict[str, dict[str, str]] = {}
     try:
@@ -46,8 +77,18 @@ def load_set_metadata() -> dict[str, dict[str, str]]:
         if resp.status_code == 200:
             for s in resp.json():
                 set_id = str(s.get("id", "")).lower().strip()
-                tcg_code = str(s.get("tcgOnline") or "").strip().upper()
-                if not set_id or not _is_english_set_code(tcg_code):
+                if not set_id:
+                    continue
+
+                raw_tcg_code = str(s.get("tcgOnline") or "").strip().upper()
+                if raw_tcg_code in ENGLISH_PROMO_SET_CODES:
+                    tcg_code = raw_tcg_code
+                elif set_id in PROMO_ID_ALIASES:
+                    tcg_code = PROMO_ID_ALIASES[set_id]
+                else:
+                    tcg_code = raw_tcg_code
+
+                if not _is_english_set_code(tcg_code):
                     continue
 
                 release_date = str(s.get("releaseDate") or "0000-00-00")
@@ -58,6 +99,33 @@ def load_set_metadata() -> dict[str, dict[str, str]]:
     except requests.RequestException:
         pass
     return meta
+
+
+def get_gameplay_fingerprint(card: dict) -> tuple:
+    """
+    Creates a unique signature from a card's gameplay mechanics (ignoring art/set/rarity).
+    Two printings with the exact same name and fingerprint are functionally identical cards.
+    """
+    name = str(card.get("name", "")).strip().lower()
+    category = str(card.get("category", "")).strip().lower()
+    hp = str(card.get("hp", ""))
+
+    abilities = tuple(
+        (str(a.get("name", "")).strip().lower(), str(a.get("effect", "")).strip().lower())
+        for a in card.get("abilities", [])
+    )
+    attacks = tuple(
+        (
+            str(a.get("name", "")).strip().lower(),
+            tuple(a.get("cost", [])),
+            str(a.get("damage", "")).strip().lower(),
+            str(a.get("effect", "")).strip().lower(),
+        )
+        for a in card.get("attacks", [])
+    )
+    effect = str(card.get("effect", "")).strip().lower()
+
+    return (name, category, hp, abilities, attacks, effect)
 
 
 @st.cache_data(ttl=3600)
@@ -108,33 +176,6 @@ def search_card_suggestions(searchterm: str) -> list[tuple[str, dict]]:
         return []
 
 
-def get_gameplay_fingerprint(card: dict) -> tuple:
-    """
-    Creates a unique signature from a card's gameplay mechanics (ignoring art/set/rarity).
-    Two printings with the exact same name and fingerprint are functionally identical cards.
-    """
-    name = str(card.get("name", "")).strip().lower()
-    category = str(card.get("category", "")).strip().lower()
-    hp = str(card.get("hp", ""))
-
-    abilities = tuple(
-        (str(a.get("name", "")).strip().lower(), str(a.get("effect", "")).strip().lower())
-        for a in card.get("abilities", [])
-    )
-    attacks = tuple(
-        (
-            str(a.get("name", "")).strip().lower(),
-            tuple(a.get("cost", [])),
-            str(a.get("damage", "")).strip().lower(),
-            str(a.get("effect", "")).strip().lower(),
-        )
-        for a in card.get("attacks", [])
-    )
-    effect = str(card.get("effect", "")).strip().lower()
-
-    return (name, category, hp, abilities, attacks, effect)
-
-
 @st.cache_data(ttl=3600)
 def fetch_full_card_details(selected_card: dict) -> dict:
     """Fetches full card stats/attacks and resolves the high-res image (no pricing)."""
@@ -149,8 +190,9 @@ def fetch_full_card_details(selected_card: dict) -> dict:
             resp = requests.get(f"{TCGDEX_API}/cards/{card_id}", timeout=10)
             if resp.status_code == 200:
                 card = resp.json()
-                tcg_online = str(card.get("set", {}).get("tcgOnline") or "").upper()
-                card["resolved_set_code"] = tcg_online if _is_english_set_code(tcg_online) else set_code
+                raw_tcg_online = str(card.get("set", {}).get("tcgOnline") or "").strip().upper()
+                resolved_set = raw_tcg_online if _is_english_set_code(raw_tcg_online) else set_code
+                card["resolved_set_code"] = resolved_set
                 card["resolved_number"] = str(card.get("localId", number)).strip()
                 card["resolved_image"] = f"{card['image']}/high.webp" if card.get("image") else fallback_img
                 return card
@@ -223,10 +265,10 @@ def find_equivalent_printings(base_card: dict, include_alt_arts: bool) -> list[d
                 if str(item.get("name", "")).strip().lower() != base_name.lower():
                     continue
 
-                cid = str(item.get("id", ""))
+                cid = item.get("id", "")
                 raw_set_id = cid.split("-")[0].lower() if "-" in cid else ""
-                info = set_meta.get(raw_set_id)
-                if not info:
+                set_info = set_meta.get(raw_set_id)
+                if not set_info:
                     continue
 
                 detail_resp = requests.get(f"{TCGDEX_API}/cards/{cid}", timeout=10)
@@ -237,8 +279,8 @@ def find_equivalent_printings(base_card: dict, include_alt_arts: bool) -> list[d
                 if get_gameplay_fingerprint(cand) != target_fp:
                     continue
 
-                tcg_online = str(cand.get("set", {}).get("tcgOnline") or "").strip().upper()
-                cand_set = tcg_online if _is_english_set_code(tcg_online) else info["code"]
+                raw_tcg_online = str(cand.get("set", {}).get("tcgOnline") or "").strip().upper()
+                cand_set = raw_tcg_online if _is_english_set_code(raw_tcg_online) else set_info["code"]
                 cand_num = str(cand.get("localId", "")).strip()
 
                 key = (cand_set, cand_num.lstrip("0"))
@@ -436,7 +478,7 @@ with col_search1:
     st.markdown("#### 1. Primary Card (Required)")
     selected_card_1 = st_searchbox(
         search_card_suggestions,
-        placeholder="Start typing a card name (e.g. Talonflame, Cacturne)...",
+        placeholder="Start typing a card name (e.g. Talonflame, Mega Golisopod ex)...",
         key="card1_searchbox",
         clear_on_submit=False,
     )
