@@ -10,55 +10,67 @@ st.set_page_config(page_title="Limitless Card Tournament Finder", layout="wide")
 LIMITLESS_API = "https://play.limitlesstcg.com/api"
 TCGDEX_API = "https://api.tcgdex.net/v2/en"
 
-ENGLISH_SET_CODE_RE = re.compile(r"^[A-Z0-9]{2,6}$")
-
-# English Black Star Promo set codes that should always be included
-ENGLISH_PROMO_SET_CODES = {
-    "SVP",    # Scarlet & Violet Black Star Promos
-    "SWSHP",  # Sword & Shield Black Star Promos
-    "SMP",    # Sun & Moon Black Star Promos
-    "XYSP",   # XY Black Star Promos
-    "BWP",    # Black & White Black Star Promos
-    "DPP",    # Diamond & Pearl Black Star Promos
-    "HGP",    # HGSS Black Star Promos
-    "WSP",    # Wizards Black Star Promos
+# Canonical English / Limitless set codes & approximate release dates (YYYY-MM-DD)
+# Ensures English set codes (like DLR, POR, SVP, SWSHP) appear accurately and sort newest-first.
+ENGLISH_SET_REGISTRY: dict[str, tuple[str, str]] = {
+    # Scarlet & Violet / Mega / Delta era & promos
+    "dlr": ("DLR", "2026-11-06"),
+    "30c": ("30C", "2026-09-16"),
+    "pbl": ("PBL", "2026-07-17"),
+    "cri": ("CRI", "2026-05-22"),
+    "por": ("POR", "2026-03-27"),
+    "asc": ("ASC", "2026-01-30"),
+    "pfl": ("PFL", "2025-11-14"),
+    "meg": ("MEG", "2025-10-10"),
+    "mep": ("MEP", "2025-09-26"),
+    "blk": ("BLK", "2025-07-18"),
+    "wht": ("WHT", "2025-07-18"),
+    "dri": ("DRI", "2025-05-30"),
+    "jtg": ("JTG", "2025-03-28"),
+    "pre": ("PRE", "2025-01-17"),
+    "ssp": ("SSP", "2024-11-08"),
+    "scr": ("SCR", "2024-09-13"),
+    "sfa": ("SFA", "2024-08-02"),
+    "twm": ("TWM", "2024-05-24"),
+    "tef": ("TEF", "2024-03-22"),
+    "paf": ("PAF", "2024-01-26"),
+    "par": ("PAR", "2023-11-03"),
+    "mew": ("MEW", "2023-09-22"),
+    "obf": ("OBF", "2023-08-11"),
+    "pal": ("PAL", "2023-06-09"),
+    "svi": ("SVI", "2023-03-31"),
+    "svp": ("SVP", "2023-03-31"),
+    # Sword & Shield era & promos
+    "crz": ("CRZ", "2023-01-20"),
+    "sit": ("SIT", "2022-11-11"),
+    "lor": ("LOR", "2022-09-09"),
+    "pgo": ("PGO", "2022-07-01"),
+    "asr": ("ASR", "2022-05-27"),
+    "brs": ("BRS", "2022-02-25"),
+    "fst": ("FST", "2021-11-12"),
+    "cel": ("CEL", "2021-10-08"),
+    "evs": ("EVS", "2021-08-27"),
+    "cre": ("CRE", "2021-06-18"),
+    "bst": ("BST", "2021-03-19"),
+    "swshp": ("SWSHP", "2019-11-15"),
 }
 
-# Maps common promo set IDs/names to their canonical English promo code
-PROMO_ID_ALIASES = {
-    "svp": "SVP",
-    "swshp": "SWSHP",
-    "smp": "SMP",
-    "xysp": "XYSP",
-    "bwp": "BWP",
-    "dpp": "DPP",
-    "hgss-promos": "HGP",
-    "hgp": "HGP",
-    "basep": "WSP",
-    "wsp": "WSP",
-}
+ENGLISH_PROMO_SET_CODES = {"SVP", "SWSHP", "MEP", "SMP", "XYSP", "BWP", "DPP", "HGP", "WSP"}
 
 
-def _is_english_set_code(code: str) -> bool:
-    """
-    Returns True for English Black Star Promo codes (like SVP, SWSHP) and standard
-    uppercase English/PTCGL set codes, while rejecting Japanese-style set codes.
-    """
-    cleaned = str(code or "").strip().upper()
-    if not cleaned:
+def _is_japanese_set(set_id: str, code: str) -> bool:
+    sid = (set_id or "").strip().lower()
+    cd = (code or "").strip().upper()
+    if sid in ENGLISH_SET_REGISTRY or cd in ENGLISH_PROMO_SET_CODES:
         return False
-    if cleaned in ENGLISH_PROMO_SET_CODES:
+    if re.fullmatch(r"(sv|sm|xy|bw|s|m|dp|hg|pl)\d+[a-z]+", sid):
         return True
-    if str(code).strip() != cleaned:
-        return False
-    # Reject Japanese subset suffixes like SV2A, SM12A, M1S
-    if re.fullmatch(r"(SV|SM|XY|BW|S)\d+[A-Z]+", cleaned):
-        return False
-    return bool(ENGLISH_SET_CODE_RE.fullmatch(cleaned))
+    if re.fullmatch(r"(SV|SM|XY|BW|S|M|DP|HG|PL)\d+[A-Z]+", cd):
+        return True
+    return False
 
 
 def _card_number_sort_key(number_str: str) -> tuple[int, str]:
-    """Sorts card numbers numerically first, then textually as a tie-breaker."""
     cleaned = str(number_str).strip()
     digits = "".join(ch for ch in cleaned if ch.isdigit())
     num_val = int(digits) if digits else 0
@@ -68,10 +80,14 @@ def _card_number_sort_key(number_str: str) -> tuple[int, str]:
 @st.cache_data(ttl=86400)
 def load_set_metadata() -> dict[str, dict[str, str]]:
     """
-    Maps TCGdex English set IDs to their English set code and releaseDate (YYYY-MM-DD),
-    always preserving English Black Star Promo set codes like SVP and SWSHP.
+    Builds a lookup of English set IDs -> {code, release_date} using our English
+    set registry supplemented by TCGdex /sets metadata.
     """
-    meta: dict[str, dict[str, str]] = {}
+    meta: dict[str, dict[str, str]] = {
+        sid: {"code": code, "release_date": rdate}
+        for sid, (code, rdate) in ENGLISH_SET_REGISTRY.items()
+    }
+
     try:
         resp = requests.get(f"{TCGDEX_API}/sets", timeout=15)
         if resp.status_code == 200:
@@ -81,31 +97,27 @@ def load_set_metadata() -> dict[str, dict[str, str]]:
                     continue
 
                 raw_tcg_code = str(s.get("tcgOnline") or "").strip().upper()
-                if raw_tcg_code in ENGLISH_PROMO_SET_CODES:
-                    tcg_code = raw_tcg_code
-                elif set_id in PROMO_ID_ALIASES:
-                    tcg_code = PROMO_ID_ALIASES[set_id]
-                else:
-                    tcg_code = raw_tcg_code
-
-                if not _is_english_set_code(tcg_code):
+                if set_id in meta:
+                    # Keep canonical English code, update releaseDate if TCGdex provides a valid one
+                    if s.get("releaseDate"):
+                        meta[set_id]["release_date"] = str(s["releaseDate"])
                     continue
 
-                release_date = str(s.get("releaseDate") or "0000-00-00")
+                tcg_code = raw_tcg_code or set_id.upper()
+                if _is_japanese_set(set_id, tcg_code):
+                    continue
+
                 meta[set_id] = {
                     "code": tcg_code,
-                    "release_date": release_date,
+                    "release_date": str(s.get("releaseDate") or "0000-00-00"),
                 }
     except requests.RequestException:
         pass
+
     return meta
 
 
 def get_gameplay_fingerprint(card: dict) -> tuple:
-    """
-    Creates a unique signature from a card's gameplay mechanics (ignoring art/set/rarity).
-    Two printings with the exact same name and fingerprint are functionally identical cards.
-    """
     name = str(card.get("name", "")).strip().lower()
     category = str(card.get("category", "")).strip().lower()
     hp = str(card.get("hp", ""))
@@ -131,10 +143,10 @@ def get_gameplay_fingerprint(card: dict) -> tuple:
 @st.cache_data(ttl=3600)
 def search_card_suggestions(searchterm: str) -> list[tuple[str, dict]]:
     """
-    Queries TCGdex for English cards as the user types, filters to English set codes,
-    and returns (label, card_dict) tuples sorted newest-first.
+    Searches cards as the user types and returns English set code + card number
+    labels (e.g. 'Talonflame ex (DLR #88)') sorted newest-first.
     """
-    query = searchterm.strip()
+    query = (searchterm or "").strip()
     if len(query) < 2:
         return []
 
@@ -142,23 +154,26 @@ def search_card_suggestions(searchterm: str) -> list[tuple[str, dict]]:
     candidates = []
 
     try:
-        resp = requests.get(f"{TCGDEX_API}/cards", params={"name": query}, timeout=8)
+        resp = requests.get(f"{TCGDEX_API}/cards", params={"name": query}, timeout=10)
         if resp.status_code != 200:
             return []
 
-        for item in resp.json():
+        items = resp.json()
+        if not isinstance(items, list):
+            return []
+
+        for item in items:
             card_id = str(item.get("id", ""))
-            name = item.get("name", "Unknown")
+            name = str(item.get("name", "Unknown"))
             local_id = str(item.get("localId", "")).strip()
             raw_set_id = card_id.split("-")[0].lower() if "-" in card_id else ""
 
             info = set_meta.get(raw_set_id)
-            if not info:
+            set_code = (info or {}).get("code") or raw_set_id.upper() or "SET"
+            if _is_japanese_set(raw_set_id, set_code):
                 continue
 
-            set_code = info["code"]
-            release_date = info["release_date"]
-
+            release_date = (info or {}).get("release_date") or "0000-00-00"
             label = f"{name} ({set_code} #{local_id})"
             payload = {
                 "id": card_id,
@@ -171,14 +186,13 @@ def search_card_suggestions(searchterm: str) -> list[tuple[str, dict]]:
             candidates.append((release_date, _card_number_sort_key(local_id), label, payload))
 
         candidates.sort(key=lambda entry: (entry[0], entry[1]), reverse=True)
-        return [(entry[2], entry[3]) for entry in candidates[:25]]
+        return [(entry[2], entry[3]) for entry in candidates[:30]]
     except requests.RequestException:
         return []
 
 
 @st.cache_data(ttl=3600)
 def fetch_full_card_details(selected_card: dict) -> dict:
-    """Fetches full card stats/attacks and resolves the high-res image (no pricing)."""
     card_id = selected_card.get("id", "")
     set_code = selected_card.get("set_code", "").upper()
     number = str(selected_card.get("number", "")).lstrip("0")
@@ -190,9 +204,10 @@ def fetch_full_card_details(selected_card: dict) -> dict:
             resp = requests.get(f"{TCGDEX_API}/cards/{card_id}", timeout=10)
             if resp.status_code == 200:
                 card = resp.json()
+                raw_set_id = card_id.split("-")[0].lower() if "-" in card_id else ""
+                reg_code = ENGLISH_SET_REGISTRY.get(raw_set_id, (None, None))[0]
                 raw_tcg_online = str(card.get("set", {}).get("tcgOnline") or "").strip().upper()
-                resolved_set = raw_tcg_online if _is_english_set_code(raw_tcg_online) else set_code
-                card["resolved_set_code"] = resolved_set
+                card["resolved_set_code"] = reg_code or raw_tcg_online or set_code
                 card["resolved_number"] = str(card.get("localId", number)).strip()
                 card["resolved_image"] = f"{card['image']}/high.webp" if card.get("image") else fallback_img
                 return card
@@ -209,7 +224,6 @@ def fetch_full_card_details(selected_card: dict) -> dict:
 
 @st.cache_data(ttl=86400)
 def resolve_deck_card_image(name: str, set_code: str, number: str) -> str:
-    """Resolves a card image URL for rendering inside the visual decklist grid."""
     clean_set = set_code.strip().upper()
     clean_num = str(number).strip().lstrip("0")
     padded_num = clean_num.zfill(3)
@@ -235,10 +249,6 @@ def resolve_deck_card_image(name: str, set_code: str, number: str) -> str:
 
 @st.cache_data(ttl=3600)
 def find_equivalent_printings(base_card: dict, include_alt_arts: bool) -> list[dict]:
-    """
-    Finds all functionally identical English printings (alt arts, SIRs, reprints, promos)
-    matching the selected card's name and gameplay fingerprint.
-    """
     base_name = base_card.get("name", "").strip()
     base_set = base_card.get("resolved_set_code", "").upper()
     base_num = str(base_card.get("resolved_number", "")).strip()
@@ -267,9 +277,10 @@ def find_equivalent_printings(base_card: dict, include_alt_arts: bool) -> list[d
 
                 cid = item.get("id", "")
                 raw_set_id = cid.split("-")[0].lower() if "-" in cid else ""
-                set_info = set_meta.get(raw_set_id)
-                if not set_info:
+                if _is_japanese_set(raw_set_id, ""):
                     continue
+
+                set_info = set_meta.get(raw_set_id) or {"code": raw_set_id.upper()}
 
                 detail_resp = requests.get(f"{TCGDEX_API}/cards/{cid}", timeout=10)
                 if detail_resp.status_code != 200:
@@ -279,8 +290,9 @@ def find_equivalent_printings(base_card: dict, include_alt_arts: bool) -> list[d
                 if get_gameplay_fingerprint(cand) != target_fp:
                     continue
 
+                reg_code = ENGLISH_SET_REGISTRY.get(raw_set_id, (None, None))[0]
                 raw_tcg_online = str(cand.get("set", {}).get("tcgOnline") or "").strip().upper()
-                cand_set = raw_tcg_online if _is_english_set_code(raw_tcg_online) else set_info["code"]
+                cand_set = reg_code or raw_tcg_online or set_info["code"]
                 cand_num = str(cand.get("localId", "")).strip()
 
                 key = (cand_set, cand_num.lstrip("0"))
@@ -326,7 +338,6 @@ def get_recent_tournaments(limit: int, fmt: str | None, api_key: str) -> list[di
 
 
 def normalize_decklist_groups(decklist: dict | list) -> dict[str, list[dict]]:
-    """Groups a Limitless decklist into Pokemon, Trainer, and Energy card lists."""
     grouped = {"Pokémon": [], "Trainer": [], "Energy": []}
 
     if isinstance(decklist, dict):
@@ -356,10 +367,6 @@ def normalize_decklist_groups(decklist: dict | list) -> dict[str, list[dict]]:
 
 
 def count_matching_printings(decklist: dict | list, printings: list[dict]) -> tuple[int, str]:
-    """
-    Checks a decklist against all valid printings (regular, full art, IR, promos).
-    Returns (total_copies, breakdown_string).
-    """
     target_lookup = {
         (p["name"].strip().lower(), p["set_code"].strip().upper(), str(p["number"]).strip().lstrip("0"))
         for p in printings
@@ -386,7 +393,6 @@ def count_matching_printings(decklist: dict | list, printings: list[dict]) -> tu
 
 
 def render_card_panel(card_data: dict, number: str, printings: list[dict]):
-    """Renders a clean Limitless-style card panel without pricing, listing linked printings."""
     col_img, col_info = st.columns([1, 2], gap="large")
     set_code = card_data.get("resolved_set_code", "")
 
@@ -437,7 +443,6 @@ def render_card_panel(card_data: dict, number: str, printings: list[dict]):
 
 
 def render_visual_decklist(deck_record: dict):
-    """Renders a visual card grid for a selected decklist inside Streamlit."""
     st.markdown(f"### Visual Decklist — {deck_record['Player']} (#{deck_record['Place']} at {deck_record['Tournament']})")
     grouped = normalize_decklist_groups(deck_record["raw_decklist"])
 
@@ -463,23 +468,30 @@ def render_visual_decklist(deck_record: dict):
                     st.caption(f"**{c_count}x** {c_name} ({c_set} #{c_num})")
 
 
-# --- SESSION STATE FOR PERSISTENT VISUAL DECKLIST VIEWING ---
 if "search_results" not in st.session_state:
     st.session_state.search_results = []
 if "active_visual_deck_idx" not in st.session_state:
     st.session_state.active_visual_deck_idx = None
+if "search_epoch" not in st.session_state:
+    st.session_state.search_epoch = 0
 
-# --- UI LAYOUT ---
 st.title("Limitless Online Tournament Card Finder")
 
+top_r1, top_r2 = st.columns([6, 1.5])
+with top_r2:
+    if st.button("Reset Search Boxes", use_container_width=True):
+        st.session_state.search_epoch += 1
+        st.rerun()
+
+epoch = st.session_state.search_epoch
 col_search1, col_search2 = st.columns(2, gap="large")
 
 with col_search1:
     st.markdown("#### 1. Primary Card (Required)")
     selected_card_1 = st_searchbox(
         search_card_suggestions,
-        placeholder="Start typing a card name (e.g. Talonflame, Mega Golisopod ex)...",
-        key="card1_searchbox",
+        placeholder="Type at least 2 letters (e.g. Golisopod, Talonflame)...",
+        key=f"card1_searchbox_{epoch}",
         clear_on_submit=False,
     )
 
@@ -487,8 +499,8 @@ with col_search2:
     st.markdown("#### 2. Second Card Combo Filter (Optional)")
     selected_card_2 = st_searchbox(
         search_card_suggestions,
-        placeholder="Leave empty for single-card search, or type a 2nd card...",
-        key="card2_searchbox",
+        placeholder="Optional 2nd card...",
+        key=f"card2_searchbox_{epoch}",
         clear_on_submit=False,
     )
 
@@ -595,7 +607,6 @@ if run_search:
     progress.empty()
     st.session_state.search_results = matches
 
-# --- RENDER STORED SEARCH & VISUAL DECKLIST VIEWER ---
 if "card1_full" in st.session_state:
     st.markdown("---")
     if st.session_state.card2_full:
